@@ -1,15 +1,23 @@
 package com.danikula.videocache;
 
-final class Preconditions {
+public final class Preconditions {
 
-    static <T> T checkNotNull(T reference) {
+    public static <T> T checkNotNull(T reference) {
         if (reference == null) {
             throw new NullPointerException();
         }
         return reference;
     }
 
-    static <T> T checkNotNull(T reference, String errorMessage) {
+    public static void checkAllNotNull(Object... references) {
+        for (Object reference : references) {
+            if (reference == null) {
+                throw new NullPointerException();
+            }
+        }
+    }
+
+    public static <T> T checkNotNull(T reference, String errorMessage) {
         if (reference == null) {
             throw new NullPointerException(errorMessage);
         }

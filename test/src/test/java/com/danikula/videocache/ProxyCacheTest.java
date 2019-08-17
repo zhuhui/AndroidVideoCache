@@ -1,12 +1,10 @@
 package com.danikula.videocache;
 
-import com.danikula.videocache.support.PhlegmaticByteArraySource;
+import com.danikula.android.garden.io.IoUtils;
+import com.danikula.videocache.file.FileCache;
+import com.danikula.videocache.support.ProxyCacheTestUtils;
 
-import org.junit.Assert;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.robolectric.RobolectricTestRunner;
-import org.robolectric.annotation.Config;
 
 import java.io.File;
 import java.util.Arrays;
@@ -20,14 +18,13 @@ import static com.danikula.videocache.support.ProxyCacheTestUtils.generate;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.getFileContent;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.loadAssetFile;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.newCacheFile;
+import static com.danikula.videocache.support.ProxyCacheTestUtils.newPhlegmaticSource;
 import static org.fest.assertions.api.Assertions.assertThat;
 
 /**
  * @author Alexey Danilov (danikula@gmail.com).
  */
-@Config(manifest = "/src/main/AndroidManifest.xml")
-@RunWith(RobolectricTestRunner.class)
-public class ProxyCacheTest {
+public class ProxyCacheTest extends BaseTest  {
 
     @Test
     public void testNoCache() throws Exception {
@@ -88,33 +85,21 @@ public class ProxyCacheTest {
         assertThat(fetchedData).isEqualTo(sourceCopy);
     }
 
-    @Test(expected = ProxyCacheException.class)
-    public void testNoMoreSource() throws Exception {
-        int sourceSize = 942;
-        int cacheSize = 6157;
-        ByteArraySource source = new ByteArraySource(generate(sourceSize));
-        ByteArrayCache cache = new ByteArrayCache(generate(cacheSize));
-        ProxyCache proxyCache = new ProxyCache(source, cache);
-        proxyCache.read(new byte[sourceSize + cacheSize], sourceSize + cacheSize + 1, 10);
-        Assert.fail();
-    }
-
     @Test
     public void testProxyWithPhlegmaticSource() throws Exception {
         int dataSize = 100000;
         byte[] sourceData = generate(dataSize);
-        Source source = new PhlegmaticByteArraySource(sourceData, 200);
+        Source source = newPhlegmaticSource(sourceData, 200);
         ProxyCache proxyCache = new ProxyCache(source, new FileCache(newCacheFile()));
         byte[] readData = new byte[dataSize];
         proxyCache.read(readData, 0, dataSize);
         assertThat(readData).isEqualTo(sourceData);
     }
 
-
     @Test
     public void testReadEnd() throws Exception {
         int capacity = 5323;
-        Source source = new PhlegmaticByteArraySource(generate(capacity), 200);
+        Source source = newPhlegmaticSource(generate(capacity), 200);
         Cache cache = new FileCache(newCacheFile());
         ProxyCache proxyCache = new ProxyCache(source, cache);
         proxyCache.read(new byte[1], capacity - 1, 1);
@@ -126,7 +111,7 @@ public class ProxyCacheTest {
     public void testReadRandomParts() throws Exception {
         int dataSize = 123456;
         byte[] sourceData = generate(dataSize);
-        Source source = new PhlegmaticByteArraySource(sourceData, 300);
+        Source source = newPhlegmaticSource(sourceData, 300);
         File file = newCacheFile();
         Cache cache = new FileCache(file);
         ProxyCache proxyCache = new ProxyCache(source, cache);
@@ -176,5 +161,20 @@ public class ProxyCacheTest {
         ProxyCache proxyCache = new ProxyCache(new ByteArraySource(generate(20000)), cache);
         proxyCache.read(new byte[5], 19999, 5);
         assertThat(cache.isCompleted()).isTrue();
+    }
+
+    @Test
+    public void testNoTouchSource() throws Exception {
+        int dataSize = 2000;
+        byte[] data = generate(dataSize);
+        File file = newCacheFile();
+        IoUtils.saveToFile(data, file);
+
+        Source source = ProxyCacheTestUtils.newAngryHttpUrlSource();
+        ProxyCache proxyCache = new ProxyCache(source, new FileCache(file));
+        byte[] readData = new byte[dataSize];
+        proxyCache.read(readData, 0, dataSize);
+
+        assertThat(readData).isEqualTo(data);
     }
 }

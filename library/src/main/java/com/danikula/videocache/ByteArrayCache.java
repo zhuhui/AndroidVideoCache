@@ -3,9 +3,6 @@ package com.danikula.videocache;
 import java.io.ByteArrayInputStream;
 import java.util.Arrays;
 
-import static com.danikula.videocache.Preconditions.checkArgument;
-import static com.danikula.videocache.Preconditions.checkNotNull;
-
 /**
  * Simple memory based {@link Cache} implementation.
  *
@@ -24,7 +21,6 @@ public class ByteArrayCache implements Cache {
         this.data = Preconditions.checkNotNull(data);
     }
 
-
     @Override
     public int read(byte[] buffer, long offset, int length) throws ProxyCacheException {
         if (offset >= data.length) {
@@ -37,7 +33,7 @@ public class ByteArrayCache implements Cache {
     }
 
     @Override
-    public int available() throws ProxyCacheException {
+    public long available() throws ProxyCacheException {
         return data.length;
     }
 

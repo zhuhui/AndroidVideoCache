@@ -4,6 +4,7 @@
 
 /.idea
 /build
+/publish.sh
 /local.properties
 /gradle.properties
 /library/build

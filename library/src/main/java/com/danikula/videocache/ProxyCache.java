@@ -1,13 +1,11 @@
 package com.danikula.videocache;
 
-import android.os.Handler;
-import android.os.Looper;
-import android.util.Log;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static com.danikula.videocache.Preconditions.checkNotNull;
-import static com.danikula.videocache.ProxyCacheUtils.LOG_TAG;
 
 /**
  * Proxy for {@link Source} with caching support ({@link Cache}).
@@ -18,35 +16,24 @@ import static com.danikula.videocache.ProxyCacheUtils.LOG_TAG;
  *
  * @author Alexey Danilov (danikula@gmail.com).
  */
-public class ProxyCache {
+class ProxyCache {
 
+    private static final Logger LOG = LoggerFactory.getLogger("ProxyCache");
     private static final int MAX_READ_SOURCE_ATTEMPTS = 1;
 
     private final Source source;
     private final Cache cache;
-    private final Object wc;
-    private final Handler handler;
+    private final Object wc = new Object();
+    private final Object stopLock = new Object();
+    private final AtomicInteger readSourceErrorsCount;
     private volatile Thread sourceReaderThread;
     private volatile boolean stopped;
-    private final AtomicInteger readSourceErrorsCount;
-    private CacheListener cacheListener;
-    private final boolean logEnabled;
-
-    public ProxyCache(Source source, Cache cache, boolean logEnabled) {
-        this.source = checkNotNull(source);
-        this.cache = checkNotNull(cache);
-        this.logEnabled = logEnabled;
-        this.wc = new Object();
-        this.handler = new Handler(Looper.getMainLooper());
-        this.readSourceErrorsCount = new AtomicInteger();
-    }
+    private volatile int percentsAvailable = -1;
 
     public ProxyCache(Source source, Cache cache) {
-        this(source, cache, false);
-    }
-
-    public void setCacheListener(CacheListener cacheListener) {
-        this.cacheListener = cacheListener;
+        this.source = checkNotNull(source);
+        this.cache = checkNotNull(cache);
+        this.readSourceErrorsCount = new AtomicInteger();
     }
 
     public int read(byte[] buffer, long offset, int length) throws ProxyCacheException {
@@ -55,21 +42,14 @@ public class ProxyCache {
         while (!cache.isCompleted() && cache.available() < (offset + length) && !stopped) {
             readSourceAsync();
             waitForSourceData();
-            checkIsCacheValid();
             checkReadSourceErrorsCount();
         }
         int read = cache.read(buffer, offset, length);
-        if (isLogEnabled()) {
-            Log.d(LOG_TAG, "Read data[" + read + " bytes] from cache with offset " + offset + ": " + ProxyCacheUtils.preview(buffer, read));
+        if (cache.isCompleted() && percentsAvailable != 100) {
+            percentsAvailable = 100;
+            onCachePercentsAvailableChanged(100);
         }
         return read;
-    }
-
-    private void checkIsCacheValid() throws ProxyCacheException {
-        int sourceAvailable = source.available();
-        if (sourceAvailable > 0 && cache.available() > sourceAvailable) {
-            throw new ProxyCacheException("Unexpected cache: cache [" + cache.available() + " bytes] > source[" + sourceAvailable + " bytes]");
-        }
     }
 
     private void checkReadSourceErrorsCount() throws ProxyCacheException {
@@ -81,22 +61,24 @@ public class ProxyCache {
     }
 
     public void shutdown() {
-        try {
-            stopped = true;
-            if (sourceReaderThread != null) {
-                sourceReaderThread.interrupt();
+        synchronized (stopLock) {
+            LOG.debug("Shutdown proxy for " + source);
+            try {
+                stopped = true;
+                if (sourceReaderThread != null) {
+                    sourceReaderThread.interrupt();
+                }
+                cache.close();
+            } catch (ProxyCacheException e) {
+                onError(e);
             }
-            cache.close();
-        } catch (ProxyCacheException e) {
-            onError(e);
         }
     }
 
-    private void readSourceAsync() throws ProxyCacheException {
-
+    private synchronized void readSourceAsync() throws ProxyCacheException {
         boolean readingInProgress = sourceReaderThread != null && sourceReaderThread.getState() != Thread.State.TERMINATED;
         if (!stopped && !cache.isCompleted() && !readingInProgress) {
-            sourceReaderThread = new Thread(new SourceReaderRunnable(), "Source reader for ProxyCache");
+            sourceReaderThread = new Thread(new SourceReaderRunnable(), "Source reader for " + source);
             sourceReaderThread.start();
         }
     }
@@ -111,48 +93,74 @@ public class ProxyCache {
         }
     }
 
-    private void notifyNewCacheDataAvailable(final int cachePercentage) {
-        handler.post(new Runnable() {
-            @Override
-            public void run() {
-                if (cacheListener != null) {
-                    cacheListener.onCacheDataAvailable(cachePercentage);
-                }
-            }
-        });
+    private void notifyNewCacheDataAvailable(long cacheAvailable, long sourceAvailable) {
+        onCacheAvailable(cacheAvailable, sourceAvailable);
 
         synchronized (wc) {
             wc.notifyAll();
         }
     }
 
+    protected void onCacheAvailable(long cacheAvailable, long sourceLength) {
+        boolean zeroLengthSource = sourceLength == 0;
+        int percents = zeroLengthSource ? 100 : (int) ((float) cacheAvailable / sourceLength * 100);
+        boolean percentsChanged = percents != percentsAvailable;
+        boolean sourceLengthKnown = sourceLength >= 0;
+        if (sourceLengthKnown && percentsChanged) {
+            onCachePercentsAvailableChanged(percents);
+        }
+        percentsAvailable = percents;
+    }
+
+    protected void onCachePercentsAvailableChanged(int percentsAvailable) {
+    }
+
     private void readSource() {
-        int cachePercentage = 0;
+        long sourceAvailable = -1;
+        long offset = 0;
         try {
-            int offset = cache.available();
+            offset = cache.available();
             source.open(offset);
+            sourceAvailable = source.length();
             byte[] buffer = new byte[ProxyCacheUtils.DEFAULT_BUFFER_SIZE];
             int readBytes;
-            while ((readBytes = source.read(buffer)) != -1 && !Thread.currentThread().isInterrupted() && !stopped) {
-                if (isLogEnabled()) {
-                    Log.d(LOG_TAG, "Write data[" + readBytes + " bytes] to cache from source with offset " + offset + ": " + ProxyCacheUtils.preview(buffer, readBytes));
+            while ((readBytes = source.read(buffer)) != -1) {
+                synchronized (stopLock) {
+                    if (isStopped()) {
+                        return;
+                    }
+                    cache.append(buffer, readBytes);
                 }
-                cache.append(buffer, readBytes);
                 offset += readBytes;
-                cachePercentage = offset * 100 / source.available();
-
-                notifyNewCacheDataAvailable(cachePercentage);
+                notifyNewCacheDataAvailable(offset, sourceAvailable);
             }
-            if (cache.available() == source.available()) {
-                cache.complete();
-            }
+            tryComplete();
+            onSourceRead();
         } catch (Throwable e) {
             readSourceErrorsCount.incrementAndGet();
             onError(e);
         } finally {
             closeSource();
-            notifyNewCacheDataAvailable(cachePercentage);
+            notifyNewCacheDataAvailable(offset, sourceAvailable);
         }
+    }
+
+    private void onSourceRead() {
+        // guaranteed notify listeners after source read and cache completed
+        percentsAvailable = 100;
+        onCachePercentsAvailableChanged(percentsAvailable);
+    }
+
+    private void tryComplete() throws ProxyCacheException {
+        synchronized (stopLock) {
+            if (!isStopped() && cache.available() == source.length()) {
+                cache.complete();
+            }
+        }
+    }
+
+    private boolean isStopped() {
+        return Thread.currentThread().isInterrupted() || stopped;
     }
 
     private void closeSource() {
@@ -164,12 +172,12 @@ public class ProxyCache {
     }
 
     protected final void onError(final Throwable e) {
-        Log.e(LOG_TAG, "ProxyCache error", e);
-        handler.post(new ErrorDeliverer(e));
-    }
-
-    protected boolean isLogEnabled() {
-        return logEnabled;
+        boolean interruption = e instanceof InterruptedProxyCacheException;
+        if (interruption) {
+            LOG.debug("ProxyCache is interrupted");
+        } else {
+            LOG.error("ProxyCache error", e);
+        }
     }
 
     private class SourceReaderRunnable implements Runnable {
@@ -177,26 +185,6 @@ public class ProxyCache {
         @Override
         public void run() {
             readSource();
-        }
-    }
-
-    private class ErrorDeliverer implements Runnable {
-
-        private final Throwable error;
-
-        public ErrorDeliverer(Throwable error) {
-            this.error = error;
-        }
-
-        @Override
-        public void run() {
-            if (error instanceof ProxyCacheException) {
-                if (cacheListener != null) {
-                    cacheListener.onError((ProxyCacheException) error);
-                }
-            } else {
-                throw new RuntimeException("Unexpected error!", error);
-            }
         }
     }
 }

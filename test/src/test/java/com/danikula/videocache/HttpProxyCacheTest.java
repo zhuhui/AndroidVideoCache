@@ -1,141 +1,259 @@
 package com.danikula.videocache;
 
 import com.danikula.android.garden.io.IoUtils;
-import com.danikula.videocache.support.AngryHttpUrlSource;
+import com.danikula.videocache.file.FileCache;
+import com.danikula.videocache.sourcestorage.SourceInfoStorage;
+import com.danikula.videocache.sourcestorage.SourceInfoStorageFactory;
+import com.danikula.videocache.support.ProxyCacheTestUtils;
 import com.danikula.videocache.support.Response;
 
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.robolectric.RobolectricTestRunner;
-import org.robolectric.annotation.Config;
+import org.mockito.Mockito;
+import org.robolectric.RuntimeEnvironment;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.util.Arrays;
+import java.io.IOException;
+import java.net.Socket;
+import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static com.danikula.videocache.support.ProxyCacheTestUtils.ASSETS_DATA_BIG_NAME;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.ASSETS_DATA_NAME;
-import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_BIG_SIZE;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_BIG_URL;
+import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_SIZE;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.HTTP_DATA_URL;
-import static com.danikula.videocache.support.ProxyCacheTestUtils.generate;
-import static com.danikula.videocache.support.ProxyCacheTestUtils.getFileContent;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.loadAssetFile;
+import static com.danikula.videocache.support.ProxyCacheTestUtils.loadTestData;
 import static com.danikula.videocache.support.ProxyCacheTestUtils.newCacheFile;
-import static com.danikula.videocache.support.ProxyCacheTestUtils.readProxyResponse;
 import static org.fest.assertions.api.Assertions.assertThat;
+import static org.fest.assertions.api.Assertions.fail;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyInt;
+import static org.mockito.Matchers.anyLong;
+import static org.mockito.Matchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
+ * Test {@link HttpProxyCache}.
+ *
  * @author Alexey Danilov (danikula@gmail.com).
  */
-@Config(manifest = "src/main/AndroidManifest.xml")
-@RunWith(RobolectricTestRunner.class)
-public class HttpProxyCacheTest {
+public class HttpProxyCacheTest extends BaseTest {
 
     @Test
-    public void testHttpProxyCache() throws Exception {
-        HttpUrlSource source = new HttpUrlSource(HTTP_DATA_URL);
-        File file = newCacheFile();
-        HttpProxyCache proxy = new HttpProxyCache(source, new FileCache(file));
-        Response response = readProxyResponse(proxy);
+    public void testProcessRequestNoCache() throws Exception {
+        Response response = processRequest(HTTP_DATA_URL, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+
+        assertThat(response.data).isEqualTo(loadTestData());
         assertThat(response.code).isEqualTo(200);
-        assertThat(response.data).isEqualTo(getFileContent(file));
-        assertThat(response.data).isEqualTo(loadAssetFile(ASSETS_DATA_NAME));
-        proxy.shutdown();
-    }
-
-    @Test
-    public void testProxyContentWithPartialCache() throws Exception {
-        HttpUrlSource source = new HttpUrlSource(HTTP_DATA_URL);
-        int cacheSize = 1000;
-        HttpProxyCache proxy = new HttpProxyCache(source, new ByteArrayCache(new byte[cacheSize]));
-
-        Response proxyResponse = readProxyResponse(proxy);
-        byte[] expected = loadAssetFile(ASSETS_DATA_NAME);
-        Arrays.fill(expected, 0, cacheSize, (byte) 0);
-        assertThat(proxyResponse.data).isEqualTo(expected);
-        proxy.shutdown();
-    }
-
-    @Test
-    public void testMimeFromResponse() throws Exception {
-        HttpUrlSource source = new HttpUrlSource("https://dl.dropboxusercontent.com/u/15506779/persistent/proxycache/android");
-        HttpProxyCache proxy = new HttpProxyCache(source, new ByteArrayCache(new byte[0]));
-        proxy.read(new byte[1], 0, 1);
-        assertThat(source.getMime()).isEqualTo("application/octet-stream");
-        proxy.shutdown();
-    }
-
-    @Test
-    public void testProxyFullResponse() throws Exception {
-        File file = newCacheFile();
-        HttpProxyCache proxy = new HttpProxyCache(new HttpUrlSource(HTTP_DATA_BIG_URL), new FileCache(file));
-        Response response = readProxyResponse(proxy);
-
-        assertThat(response.code).isEqualTo(200);
-        assertThat(response.contentLength).isEqualTo(HTTP_DATA_BIG_SIZE);
+        assertThat(response.contentLength).isEqualTo(HTTP_DATA_SIZE);
         assertThat(response.contentType).isEqualTo("image/jpeg");
-        assertThat(response.headers.containsKey("Accept-Ranges")).isTrue();
-        assertThat(response.headers.get("Accept-Ranges").get(0)).isEqualTo("bytes");
-        assertThat(response.headers.containsKey("Content-Range")).isFalse();
-        assertThat(response.data).isEqualTo(getFileContent(file));
-        assertThat(response.data).isEqualTo(loadAssetFile(ASSETS_DATA_BIG_NAME));
-        proxy.shutdown();
     }
 
     @Test
-    public void testProxyPartialResponse() throws Exception {
-        int offset = 42000;
-        File file = newCacheFile();
-        HttpProxyCache proxy = new HttpProxyCache(new HttpUrlSource(HTTP_DATA_BIG_URL), new FileCache(file));
-        Response response = readProxyResponse(proxy, offset);
+    public void testProcessPartialRequestWithoutCache() throws Exception {
+        FileCache fileCache = new FileCache(ProxyCacheTestUtils.newCacheFile());
+        FileCache spyFileCache = Mockito.spy(fileCache);
+        doThrow(new RuntimeException()).when(spyFileCache).read(any(byte[].class), anyLong(), anyInt());
 
+        String httpRequest = "GET /" + HTTP_DATA_URL + " HTTP/1.1\nRange: bytes=2000-";
+        Response response = processRequest(HTTP_DATA_URL, httpRequest, spyFileCache);
+
+        byte[] fullData = loadTestData();
+        byte[] partialData = new byte[fullData.length - 2000];
+        System.arraycopy(fullData, 2000, partialData, 0, partialData.length);
+        assertThat(response.data).isEqualTo(partialData);
         assertThat(response.code).isEqualTo(206);
-        assertThat(response.contentLength).isEqualTo(HTTP_DATA_BIG_SIZE - offset);
+    }
+
+    @Test   // https://github.com/danikula/AndroidVideoCache/issues/43
+    public void testPreventClosingOriginalSourceForNewPartialRequestWithoutCache() throws Exception {
+        HttpUrlSource source = new HttpUrlSource(HTTP_DATA_BIG_URL);
+        FileCache fileCache = new FileCache(ProxyCacheTestUtils.newCacheFile());
+        HttpProxyCache proxyCache = new HttpProxyCache(source, fileCache);
+        ExecutorService executor = Executors.newFixedThreadPool(5);
+        Future<Response> firstRequestFeature = processAsync(executor, proxyCache, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+        Thread.sleep(100);  // wait for first request started to process
+
+        int offset = 30000;
+        String partialRequest = "GET /" + HTTP_DATA_URL + " HTTP/1.1\nRange: bytes=" + offset + "-";
+        Future<Response> secondRequestFeature = processAsync(executor, proxyCache, partialRequest);
+
+        Response secondResponse = secondRequestFeature.get();
+        Response firstResponse = firstRequestFeature.get();
+
+        byte[] responseData = loadAssetFile(ASSETS_DATA_BIG_NAME);
+        assertThat(firstResponse.data).isEqualTo(responseData);
+
+        byte[] partialData = new byte[responseData.length - offset];
+        System.arraycopy(responseData, offset, partialData, 0, partialData.length);
+        assertThat(secondResponse.data).isEqualTo(partialData);
+    }
+
+    @Test
+    public void testProcessManyThreads() throws Exception {
+        final String url = "https://raw.githubusercontent.com/danikula/AndroidVideoCache/master/files/space.jpg";
+        HttpUrlSource source = new HttpUrlSource(url);
+        FileCache fileCache = new FileCache(ProxyCacheTestUtils.newCacheFile());
+        final HttpProxyCache proxyCache = new HttpProxyCache(source, fileCache);
+        final byte[] loadedData = loadAssetFile("space.jpg");
+        final Random random = new Random(System.currentTimeMillis());
+        int concurrentRequests = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(concurrentRequests);
+        Future[] results = new Future[concurrentRequests];
+        int[] offsets = new int[concurrentRequests];
+        final CountDownLatch finishLatch = new CountDownLatch(concurrentRequests);
+        final CountDownLatch startLatch = new CountDownLatch(1);
+        for (int i = 0; i < concurrentRequests; i++) {
+            final int offset = random.nextInt(loadedData.length);
+            offsets[i] = offset;
+            results[i] = executor.submit(new Callable<Response>() {
+
+                @Override
+                public Response call() throws Exception {
+                    try {
+                        startLatch.await();
+                        String partialRequest = "GET /" + url + " HTTP/1.1\nRange: bytes=" + offset + "-";
+                        return processRequest(proxyCache, partialRequest);
+                    } finally {
+                        finishLatch.countDown();
+                    }
+                }
+            });
+        }
+        startLatch.countDown();
+        finishLatch.await();
+
+        for (int i = 0; i < results.length; i++) {
+            Response response = (Response) results[i].get();
+            int offset = offsets[i];
+            byte[] partialData = new byte[loadedData.length - offset];
+            System.arraycopy(loadedData, offset, partialData, 0, partialData.length);
+            assertThat(response.data).isEqualTo(partialData);
+        }
+    }
+
+    @Test
+    public void testLoadEmptyFile() throws Exception {
+        String zeroSizeUrl = "https://raw.githubusercontent.com/danikula/AndroidVideoCache/master/files/empty.txt";
+        HttpUrlSource source = new HttpUrlSource(zeroSizeUrl);
+        HttpProxyCache proxyCache = new HttpProxyCache(source, new FileCache(ProxyCacheTestUtils.newCacheFile()));
+        GetRequest request = new GetRequest("GET /" + HTTP_DATA_URL + " HTTP/1.1");
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Socket socket = mock(Socket.class);
+        when(socket.getOutputStream()).thenReturn(out);
+
+        CacheListener listener = Mockito.mock(CacheListener.class);
+        proxyCache.registerCacheListener(listener);
+        proxyCache.processRequest(request, socket);
+        proxyCache.registerCacheListener(null);
+        Response response = new Response(out.toByteArray());
+
+        Mockito.verify(listener).onCacheAvailable(Mockito.<File>any(), eq(zeroSizeUrl), eq(100));
+        assertThat(response.data).isEmpty();
+    }
+
+    @Test
+    public void testCacheListenerCalledAtTheEnd() throws Exception {
+        File file = ProxyCacheTestUtils.newCacheFile();
+        File tempFile = ProxyCacheTestUtils.getTempFile(file);
+        HttpProxyCache proxyCache = new HttpProxyCache(new HttpUrlSource(HTTP_DATA_URL), new FileCache(file));
+        CacheListener listener = Mockito.mock(CacheListener.class);
+        proxyCache.registerCacheListener(listener);
+        processRequest(proxyCache, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+
+        Mockito.verify(listener).onCacheAvailable(tempFile, HTTP_DATA_URL, 100);    // must be called for temp file ...
+        Mockito.verify(listener).onCacheAvailable(file, HTTP_DATA_URL, 100);        // .. and for original file too
+    }
+
+    @Test(expected = ProxyCacheException.class)
+    public void testTouchSourceForAbsentSourceInfoAndCache() throws Exception {
+        SourceInfoStorage sourceInfoStorage = SourceInfoStorageFactory.newEmptySourceInfoStorage();
+        HttpUrlSource source = ProxyCacheTestUtils.newNotOpenableHttpUrlSource(HTTP_DATA_URL, sourceInfoStorage);
+        HttpProxyCache proxyCache = new HttpProxyCache(source, new FileCache(newCacheFile()));
+        processRequest(proxyCache, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+        proxyCache.shutdown();
+        fail("Angry source should throw error! There is no file and caches source info");
+    }
+
+    @Test(expected = ProxyCacheException.class)
+    public void testTouchSourceForExistedSourceInfoAndAbsentCache() throws Exception {
+        SourceInfoStorage sourceInfoStorage = SourceInfoStorageFactory.newSourceInfoStorage(RuntimeEnvironment.application);
+        sourceInfoStorage.put(HTTP_DATA_URL, new SourceInfo(HTTP_DATA_URL, HTTP_DATA_SIZE, "image/jpg"));
+        HttpUrlSource source = ProxyCacheTestUtils.newNotOpenableHttpUrlSource(HTTP_DATA_URL, sourceInfoStorage);
+        HttpProxyCache proxyCache = new HttpProxyCache(source, new FileCache(newCacheFile()));
+        processRequest(proxyCache, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+        proxyCache.shutdown();
+        fail("Angry source should throw error! There is no cache file");
+    }
+
+    @Test
+    public void testTouchSourceForExistedSourceInfoAndCache() throws Exception {
+        SourceInfoStorage sourceInfoStorage = SourceInfoStorageFactory.newSourceInfoStorage(RuntimeEnvironment.application);
+        sourceInfoStorage.put(HTTP_DATA_URL, new SourceInfo(HTTP_DATA_URL, HTTP_DATA_SIZE, "cached/mime"));
+        HttpUrlSource source = ProxyCacheTestUtils.newNotOpenableHttpUrlSource(HTTP_DATA_URL, sourceInfoStorage);
+        File file = newCacheFile();
+        IoUtils.saveToFile(loadAssetFile(ASSETS_DATA_NAME), file);
+        HttpProxyCache proxyCache = new HttpProxyCache(source, new FileCache(file));
+        Response response = processRequest(proxyCache, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+        proxyCache.shutdown();
+        assertThat(response.data).isEqualTo(loadAssetFile(ASSETS_DATA_NAME));
+        assertThat(response.contentLength).isEqualTo(HTTP_DATA_SIZE);
+        assertThat(response.contentType).isEqualTo("cached/mime");
+    }
+
+    @Test
+    public void testReuseSourceInfo() throws Exception {
+        SourceInfoStorage sourceInfoStorage = SourceInfoStorageFactory.newSourceInfoStorage(RuntimeEnvironment.application);
+        HttpUrlSource source = new HttpUrlSource(HTTP_DATA_URL, sourceInfoStorage);
+        File cacheFile = newCacheFile();
+        HttpProxyCache proxyCache = new HttpProxyCache(source, new FileCache(cacheFile));
+        processRequest(proxyCache, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+
+        HttpUrlSource notOpenableSource = ProxyCacheTestUtils.newNotOpenableHttpUrlSource(HTTP_DATA_URL, sourceInfoStorage);
+        HttpProxyCache proxyCache2 = new HttpProxyCache(notOpenableSource, new FileCache(cacheFile));
+        Response response = processRequest(proxyCache2, "GET /" + HTTP_DATA_URL + " HTTP/1.1");
+        proxyCache.shutdown();
+
+        assertThat(response.data).isEqualTo(loadAssetFile(ASSETS_DATA_NAME));
+        assertThat(response.contentLength).isEqualTo(HTTP_DATA_SIZE);
         assertThat(response.contentType).isEqualTo("image/jpeg");
-        assertThat(response.headers.containsKey("Accept-Ranges")).isTrue();
-        assertThat(response.headers.get("Accept-Ranges").get(0)).isEqualTo("bytes");
-        assertThat(response.headers.containsKey("Content-Range")).isTrue();
-        String rangeHeader = String.format("bytes %d-%d/%d", offset, HTTP_DATA_BIG_SIZE, HTTP_DATA_BIG_SIZE);
-        assertThat(response.headers.get("Content-Range").get(0)).isEqualTo(rangeHeader);
-        byte[] expectedData = Arrays.copyOfRange(loadAssetFile(ASSETS_DATA_BIG_NAME), offset, HTTP_DATA_BIG_SIZE);
-        assertThat(response.data).isEqualTo(expectedData);
-        assertThat(getFileContent(file)).isEqualTo(loadAssetFile(ASSETS_DATA_BIG_NAME));
-        proxy.shutdown();
     }
 
-    @Test
-    public void testAppendCache() throws Exception {
-        byte[] cachedPortion = generate(1200);
-        File file = newCacheFile();
-        File partialFile = new File(file.getParentFile(), file.getName() + ".download");
-        IoUtils.saveToFile(cachedPortion, partialFile);
-        Cache cache = new FileCache(partialFile);
-        assertThat(cache.isCompleted()).isFalse();
-
-        HttpProxyCache proxy = new HttpProxyCache(new HttpUrlSource(HTTP_DATA_BIG_URL), cache);
-        readProxyResponse(proxy);
-        proxy.shutdown();
-
-        assertThat(cache.isCompleted()).isTrue();
-
-        byte[] expectedData = loadAssetFile(ASSETS_DATA_BIG_NAME);
-        System.arraycopy(cachedPortion, 0, expectedData, 0, cachedPortion.length);
-        assertThat(file.length()).isEqualTo(HTTP_DATA_BIG_SIZE);
-        assertThat(expectedData).isEqualTo(getFileContent(file));
+    private Response processRequest(String sourceUrl, String httpRequest) throws ProxyCacheException, IOException {
+        FileCache fileCache = new FileCache(ProxyCacheTestUtils.newCacheFile());
+        return processRequest(sourceUrl, httpRequest, fileCache);
     }
 
-    @Test
-    public void testNoTouchSource() throws Exception {
-        File file = newCacheFile();
-        IoUtils.saveToFile(loadAssetFile(ASSETS_DATA_BIG_NAME), file);
-        FileCache cache = new FileCache(file);
-        HttpProxyCache proxy = new HttpProxyCache(new HttpUrlSource(HTTP_DATA_BIG_URL), cache);
-        Response response = readProxyResponse(proxy);
-        proxy.shutdown();
-        assertThat(response.code).isEqualTo(200);
+    private Response processRequest(String sourceUrl, String httpRequest, FileCache fileCache) throws ProxyCacheException, IOException {
+        HttpUrlSource source = new HttpUrlSource(sourceUrl);
+        HttpProxyCache proxyCache = new HttpProxyCache(source, fileCache);
+        return processRequest(proxyCache, httpRequest);
+    }
 
-        proxy = new HttpProxyCache(new AngryHttpUrlSource(HTTP_DATA_BIG_URL, "image/jpeg"), new FileCache(file));
-        readProxyResponse(proxy);
-        assertThat(response.code).isEqualTo(200);
+    private Response processRequest(HttpProxyCache proxyCache, String httpRequest) throws ProxyCacheException, IOException {
+        GetRequest request = new GetRequest(httpRequest);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Socket socket = mock(Socket.class);
+        when(socket.getOutputStream()).thenReturn(out);
+        proxyCache.processRequest(request, socket);
+        return new Response(out.toByteArray());
+    }
+
+    private Future<Response> processAsync(ExecutorService executor, final HttpProxyCache proxyCache, final String httpRequest) {
+        return executor.submit(new Callable<Response>() {
+
+            @Override
+            public Response call() throws Exception {
+                return processRequest(proxyCache, httpRequest);
+            }
+        });
     }
 }
